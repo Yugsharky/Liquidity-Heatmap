@@ -41,6 +41,16 @@ Copy the code into a new Pine Script editor in TradingView.
 Save & add to chart.
 
 Adjust inputs in the settings panel.
+VSA vs PVSRA Zones
+Mode	What it highlights	Best use for
+PVSRA	High-volume support/resistance zones based on price + volume	Good for seeing structural zones where smart money might enter/exit. Works well with your order flow context.
+VSA	Volume Spread Analysis: climaxes, upthrusts, springs	More focused on traps and potential reversals. Useful if you want zones where price may reject.
+
+Rule of Thumb for You:
+
+If you want zones likely to be touched → use PVSRA.
+
+If you want zones likely to cause a reaction or trap → use VSA.
 
 🔧 Requirements
 
