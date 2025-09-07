@@ -56,4 +56,3 @@ If you want zones likely to cause a reaction or trap → use VSA.
 
 TradingView account with Pine Script v6 support.
 
-Would you like me to also make a short tagline version (like the one-line description you’d put at the very top of the README under the title)?
