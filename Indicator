@@ -1,0 +1,316 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// @NQPAYS
+//@version=6
+indicator("Liquidity Heat Map — PVSRA/VSA with Probability", overlay=true, max_boxes_count=500)
+
+// ===== Inputs =====
+mode        = input.string("PVSRA", "Mode", options = ["PVSRA","VSA"])
+calcTF      = input.timeframe("", "Calculation timeframe (blank = chart)")
+maxZones    = input.int(300, "Max active zones", minval=20, maxval=500)
+
+volLen      = input.int(50, "Volume SMA length", minval=10)
+volPct      = input.float(150, "High-volume threshold (% of SMA)", minval=100, step=5)
+
+atrLen      = input.int(14, "ATR length", minval=5)
+spreadATR   = input.float(1.2, "Wide spread threshold (× ATR)", minval=0.5, step=0.1)
+wickPctMin  = input.float(35, "Trap wick min (% of range)", minval=5, maxval=90, step=1)
+
+zoneUnit    = input.string("ATR", "Zone height unit", options=["ATR","Percent","Ticks"])
+zoneATRk    = input.float(0.25, "ATR unit: k × ATR", minval=0.05, step=0.05)
+zonePct     = input.float(0.15, "Percent unit: % of candle", minval=0.02, maxval=2.0, step=0.01)
+zoneTicks   = input.int(50, "Ticks unit: ticks", minval=1)
+
+fadeBars    = input.int(200, "Bars until zone fades completely", minval=10)
+maxOpacity  = input.int(85, "Max color opacity (%)", minval=10, maxval=100)
+
+// Probability settings
+showProbability = input.bool(true, "Show Probability Labels")
+probPeriod     = input.int(100, "Historical periods for probability calculation", minval=20, maxval=500)
+showDebugStats = input.bool(false, "Show Debug Statistics")
+
+// ===== Higher-timeframe data (or chart TF) =====
+tf = calcTF == "" ? timeframe.period : calcTF
+[oTF,hTF,lTF,cTF,vTF,tTF] = request.security(syminfo.tickerid, tf, [open,high,low,close,volume,time], barmerge.gaps_off, barmerge.lookahead_off)
+newTFbar   = ta.change(tTF) != 0
+
+rngTF      = hTF - lTF
+atrTF      = request.security(syminfo.tickerid, tf, ta.atr(atrLen), barmerge.gaps_off, barmerge.lookahead_off)
+volSmaTF   = request.security(syminfo.tickerid, tf, ta.sma(volume, volLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+isBullTF   = cTF > oTF
+isBearTF   = cTF < oTF
+upperWTF   = hTF - math.max(cTF,oTF)
+lowerWTF   = math.min(cTF,oTF) - lTF
+wickPctUp  = rngTF > 0 ? 100 * upperWTF / rngTF : 0.0
+wickPctDn  = rngTF > 0 ? 100 * lowerWTF / rngTF : 0.0
+wideSpread = rngTF >= spreadATR * atrTF
+hiVol      = vTF >= (volPct/100.0) * volSmaTF
+
+// Vector definitions
+pvsraVec   = hiVol
+vsaClimax  = hiVol and wideSpread
+vsaUpthrust= hiVol and isBearTF and (wickPctUp >= wickPctMin)
+vsaSpring  = hiVol and isBullTF and (wickPctDn >= wickPctMin)
+vsaVec     = vsaClimax or vsaUpthrust or vsaSpring
+useVec     = mode == "PVSRA" ? pvsraVec : vsaVec
+
+// ===== Probability Calculation Functions =====
+// Calculate trend strength (for probability weighting)
+trendStrength = ta.rsi(close, 14)
+volatility = ta.atr(14) / close * 100
+momentum = ta.roc(close, 10)
+
+// Historical success rate tracker - changed to weighted system
+var float totalExpectedHits = 0.0    // Sum of all probabilities
+var float actualWeightedHits = 0.0   // Weighted hits based on probability
+var int totalZonesEver = 0           // Total zones created (for tracking)
+
+calculateProbability(zonePrice, isSellZone, currentPrice, strength, distance) =>
+    // FIXED CALCULATION - only uses conditions at time of zone creation
+    
+    // Base probability (fixed starting point)
+    baseProbability = 0.55
+    
+    // Distance factor - zones closer to current price have higher probability
+    distanceFactor = if distance <= atrTF * 0.5
+        1.3  // Very close
+    else if distance <= atrTF * 1.0
+        1.1  // Close
+    else if distance <= atrTF * 2.0
+        1.0  // Medium distance  
+    else if distance <= atrTF * 4.0
+        0.8  // Far
+    else
+        0.6  // Very far
+    
+    // Volume/Strength factor - higher volume zones are more significant
+    strengthFactor = if strength >= 2.0
+        1.25  // Very high volume
+    else if strength >= 1.5
+        1.15  // High volume
+    else if strength >= 1.2
+        1.05  // Above average volume
+    else
+        0.95  // Average volume
+    
+    // Trend alignment - zones in trend direction are more likely to be hit
+    currentTrend = ta.ema(close, 21)
+    trendFactor = if isSellZone
+        // Resistance zones more likely in downtrend
+        close < currentTrend ? 1.2 : 0.85
+    else
+        // Support zones more likely in uptrend  
+        close > currentTrend ? 1.2 : 0.85
+    
+    // Market volatility - higher vol means more likely to reach zones
+    volFactor = if volatility > 1.5
+        1.15  // High volatility
+    else if volatility > 1.0
+        1.05  // Medium volatility
+    else
+        0.95  // Low volatility
+    
+    // FIXED calculation - will NEVER change after this point
+    finalProbability = baseProbability * distanceFactor * strengthFactor * trendFactor * volFactor
+    
+    // Clamp to realistic range
+    math.max(20, math.min(85, finalProbability * 100))
+
+// ===== Zone height calculator =====
+calcZoneHeight(range_, atr_) =>
+    if zoneUnit == "ATR"
+        zoneATRk * atr_
+    else if zoneUnit == "Percent"
+        zonePct * range_
+    else
+        syminfo.mintick * zoneTicks
+
+// ===== Persistent arrays =====
+var boxes   = array.new<box>()
+var labels  = array.new<label>()
+var isSellA = array.new<bool>()
+var topA    = array.new<float>()
+var botA    = array.new<float>()
+var bornA   = array.new<int>()   // bar index when created
+var strA    = array.new<float>() // strength factor for color intensity
+var probA   = array.new<float>() // probability values
+
+// ===== Create zone =====
+createZone(_isSell, _top, _bot, _strength) =>
+    if array.size(boxes) >= maxZones
+        box.delete(array.shift(boxes))
+        label.delete(array.shift(labels))
+        array.shift(isSellA), array.shift(topA), array.shift(botA), array.shift(bornA), array.shift(strA), array.shift(probA)
+    
+    // Calculate zone center and distance
+    zoneCenter = (_top + _bot) / 2
+    distance = math.abs(close - zoneCenter)
+    
+    // Calculate probability
+    probability = calculateProbability(zoneCenter, _isSell, close, _strength, distance)
+    
+    // Create box - extend far into the future so it stays visible
+    bx = box.new(bar_index, _top, bar_index + 500, _bot, border_color=color.new(color.black, 100))
+    
+    // Create probability label
+    lbl = label(na)
+    if showProbability
+        labelText = str.tostring(math.round(probability)) + "%"
+        labelColor = probability > 70 ? color.green : probability > 50 ? color.yellow : color.red
+        lbl := label.new(bar_index, zoneCenter, labelText, style=label.style_label_left, color=color.new(labelColor, 20), textcolor=color.white, size=size.small)
+    
+    // Store in arrays
+    array.push(boxes, bx)
+    array.push(labels, lbl)
+    array.push(isSellA, _isSell)
+    array.push(topA, _top)
+    array.push(botA, _bot)
+    array.push(bornA, bar_index)
+    array.push(strA, _strength)
+    array.push(probA, probability)
+
+// ===== Purge or update zones =====
+purgeCrossedZones() =>
+    i = 0
+    zonesHit = 0
+    zonesExpired = 0
+    
+    while i < array.size(boxes)
+        bx  = array.get(boxes, i)
+        lbl = array.get(labels, i)
+        isS = array.get(isSellA, i)
+        t   = array.get(topA, i)
+        b   = array.get(botA, i)
+        born= array.get(bornA, i)
+        str = array.get(strA, i)
+        prob= array.get(probA, i)
+
+        age = bar_index - born
+        opacity = math.max(0, maxOpacity - (age / fadeBars) * maxOpacity)
+        
+        // Color based on probability
+        colBase = if prob > 70
+            color.rgb(0, 255, 0)  // Green for high probability
+        else if prob > 50
+            color.rgb(255, 165, 0)  // Orange for medium probability
+        else
+            color.rgb(255, 0, 0)    // Red for low probability
+            
+        // Adjust opacity based on age and strength
+        finalOpacity = math.max(0, 100 - (opacity * (str / 2)))
+        box.set_bgcolor(bx, color.new(colBase, finalOpacity))
+        
+        crossed = (isS and close > t) or ((not isS) and close < b)
+        
+        if crossed
+            // Count successful zone
+            zonesHit += 1
+            
+            // Remove zone
+            box.delete(bx)
+            if not na(lbl)
+                label.delete(lbl)
+            array.remove(boxes, i)
+            array.remove(labels, i)
+            array.remove(isSellA, i)
+            array.remove(topA, i)
+            array.remove(botA, i)
+            array.remove(bornA, i)
+            array.remove(strA, i)
+            array.remove(probA, i)
+        else if opacity <= 0
+            // Count expired zone
+            zonesExpired += 1
+            
+            // Remove zone
+            box.delete(bx)
+            if not na(lbl)
+                label.delete(lbl)
+            array.remove(boxes, i)
+            array.remove(labels, i)
+            array.remove(isSellA, i)
+            array.remove(topA, i)
+            array.remove(botA, i)
+            array.remove(bornA, i)
+            array.remove(strA, i)
+            array.remove(probA, i)
+        else
+            // Zone stays completely unchanged - NO updates to probability or labels
+            i += 1
+    
+    [zonesHit, zonesExpired]
+
+// ===== Main Logic =====
+if newTFbar and useVec[1]
+    prevHigh  = hTF[1]
+    prevLow   = lTF[1]
+    prevRange = rngTF[1]
+    prevATR   = atrTF[1]
+    zH        = calcZoneHeight(prevRange, prevATR)
+    strength  = math.min(2.0, vTF[1] / volSmaTF[1]) // volume-based strength scale
+
+    if isBullTF[1]
+        createZone(false, prevLow, prevLow - zH, strength)
+    else if isBearTF[1]
+        createZone(true, prevHigh + zH, prevHigh, strength)
+
+// ===== Update zones every bar =====
+[zonesHit, zonesExpired] = purgeCrossedZones()
+
+// Update WEIGHTED statistics based on probability accuracy
+if zonesHit > 0 or zonesExpired > 0
+    // Process each removed zone's probability contribution
+    i = 0
+    while i < zonesHit + zonesExpired
+        if i < array.size(probA)  // Safety check
+            zoneProb = array.get(probA, i)
+            probDecimal = zoneProb / 100.0
+            
+            totalExpectedHits += probDecimal
+            totalZonesEver += 1
+            
+            // If zone was hit, add its probability to weighted hits
+            if i < zonesHit
+                actualWeightedHits += probDecimal
+        i += 1
+
+// ===== Display Statistics =====
+if showProbability and barstate.islast
+    var table infoTable = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80), border_width=1)
+    
+    // Calculate weighted accuracy (how well predictions match reality)
+    predictionAccuracy = totalExpectedHits > 0 ? (actualWeightedHits / totalExpectedHits) * 100 : 0
+    activeZones = array.size(boxes)
+    
+    // Determine prediction quality
+    accuracyRating = if totalZonesEver < 10
+        "Building..."
+    else if predictionAccuracy > 90
+        "Excellent"
+    else if predictionAccuracy > 75
+        "Good"  
+    else if predictionAccuracy > 60
+        "Fair"
+    else
+        "Poor"
+    
+    // Display improved statistics
+    table.cell(infoTable, 0, 0, "Active Zones:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, str.tostring(activeZones), text_color=color.yellow, text_size=size.small)
+    
+    table.cell(infoTable, 0, 1, "Prediction Accuracy:", text_color=color.white, text_size=size.small)
+    accuracyColor = predictionAccuracy > 75 ? color.green : predictionAccuracy > 60 ? color.yellow : color.red
+    table.cell(infoTable, 1, 1, str.tostring(math.round(predictionAccuracy)) + "%", text_color=accuracyColor, text_size=size.small)
+    
+    table.cell(infoTable, 0, 2, "Expected Hits:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(math.round(totalExpectedHits, 1)), text_color=color.gray, text_size=size.small)
+    
+    table.cell(infoTable, 0, 3, "Actual Weighted:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(math.round(actualWeightedHits, 1)), text_color=color.gray, text_size=size.small)
+    
+    table.cell(infoTable, 0, 4, "Total Tested:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(totalZonesEver), text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 5, "Quality Rating:", text_color=color.white, text_size=size.small)
+    ratingColor = accuracyRating == "Excellent" ? color.lime : accuracyRating == "Good" ? color.green : accuracyRating == "Fair" ? color.yellow : color.red
+    table.cell(infoTable, 1, 5, accuracyRating, text_color=ratingColor, text_size=size.small)
